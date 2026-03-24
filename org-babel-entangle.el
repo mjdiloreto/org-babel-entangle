@@ -98,9 +98,16 @@
   :group 'org-babel-entangle)
 
 (defcustom org-babel-entangle-no-comment-languages
-  '("json" "text")
+  '("json" "text" "markdown" "dot" "toml" "org" "xml"
+    "yaml" "typescript" "go" "rust" "kotlin" "scala"
+    "haskell" "ocaml" "elixir" "erlang" "clojure"
+    "racket" "R" "swift" "fish" "dockerfile")
   "Languages that get `:comments no' (no safe comment syntax).
-All other languages get `:comments link' for detangle compatibility."
+Includes languages without built-in Emacs modes that define comment syntax.
+All other languages get `:comments link' for detangle compatibility.
+Languages with built-in comment support: emacs-lisp, python, bash, sh,
+js, C, C++, java, ruby, perl, css, sql, makefile, conf, lua, lisp,
+scheme, html."
   :type '(repeat string)
   :group 'org-babel-entangle)
 
@@ -186,6 +193,8 @@ ROOT is the top-level directory for computing relative paths."
        ;; Recurse into directories
        ((file-directory-p file)
         (setq entries (org-babel-entangle--scan-recursive file root entries)))
+       ;; Skip non-regular files (symlinks, broken links, etc.)
+       ((not (file-regular-p file)) nil)
        ;; Skip excluded files
        ((org-babel-entangle--excluded-file-p file) nil)
        ;; Skip binary files
@@ -279,10 +288,12 @@ FIXUPS is a list of (TYPE . REL-PATH) for post-tangle fixups."
             args))
     (when (and executable-p (not shebang))
       (push ":tangle-mode (identity #o755)" args))
+    ;; Comments: per-block to avoid org property resolution issues
+    (if needs-comment-no
+        (push ":comments no" args)
+      (push ":comments link" args))
     (when needs-noweb-no
       (push ":noweb no" args))
-    (when needs-comment-no
-      (push ":comments no" args))
     (string-join (nreverse args) " ")))
 
 ;;;; Fixup generator
@@ -375,18 +386,16 @@ ENTRY is non-nil for leaf nodes (actual files)."
         (cl-pushnew (org-babel-entangle-entry-lang entry) langs :test #'equal)))
     (sort langs #'string<)))
 
-(defun org-babel-entangle--file-header (title entries)
-  "Generate org file header with TITLE and property lines for ENTRIES."
-  (let ((lines nil)
-        (no-comment-langs (org-babel-entangle--no-comment-languages entries)))
+(defun org-babel-entangle--file-header (title _entries)
+  "Generate org file header with TITLE.
+Comments link/no is handled per-block in header-args, not globally,
+because org-babel's property resolution can override per-block args."
+  (let ((lines nil))
     ;; File-local variable for auto-tangle
     (when org-babel-entangle-auto-tangle
       (push "# -*- eval: (org-auto-tangle-mode); -*-" lines))
     (push (format "#+TITLE: %s" title) lines)
-    (push "#+PROPERTY: header-args :mkdirp yes :padline no :comments link" lines)
-    ;; Per-language overrides
-    (dolist (lang no-comment-langs)
-      (push (format "#+PROPERTY: header-args:%s :comments no" lang) lines))
+    (push "#+PROPERTY: header-args :mkdirp yes :padline no" lines)
     (push (format "#+STARTUP: %s" org-babel-entangle-startup) lines)
     (push "" lines)
     (string-join (nreverse lines) "\n")))
@@ -498,9 +507,43 @@ Usage: emacs --batch -l org-babel-entangle.el \\
     (setq command-line-args-left (cddr command-line-args-left))
     (org-babel-entangle-directory dir output)))
 
+(defun org-babel-entangle--strip-comment-links (file)
+  "Remove org-babel comment-link markers from FILE in-place.
+These are the `# [[file:...]]' and `# ...ends here' lines added
+by `:comments link' during tangle."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    ;; Remove "# [[file:...]]" or "// [[file:...]]" or "<!-- [[file:...]] -->" lines
+    (while (re-search-forward
+            "^[[:blank:]]*\\(?:#\\|//\\|;+\\|%\\|--\\|/\\*\\|<!--\\)[[:blank:]]*\\[\\[file:.*\\]\\].*\n?"
+            nil t)
+      (replace-match ""))
+    (goto-char (point-min))
+    ;; Remove "# ...ends here" or "// ...ends here" etc. lines
+    (while (re-search-forward
+            "^[[:blank:]]*\\(?:#\\|//\\|;+\\|%\\|--\\).*ends here.*\n?"
+            nil t)
+      (replace-match ""))
+    (goto-char (point-min))
+    ;; Remove "<!-- ...ends here -->" lines
+    (while (re-search-forward
+            "^[[:blank:]]*<!--.*ends here.*-->.*\n?"
+            nil t)
+      (replace-match ""))
+    ;; Remove "/* ...ends here */" lines
+    (goto-char (point-min))
+    (while (re-search-forward
+            "^[[:blank:]]*/\\*.*ends here.*\\*/.*\n?"
+            nil t)
+      (replace-match ""))
+    (write-region (point-min) (point-max) file nil 'silent)))
+
 ;;;###autoload
 (defun org-babel-entangle-verify (org-file source-dir)
   "Tangle ORG-FILE into a temp dir, run fixups, diff against SOURCE-DIR.
+Strips comment-link markers before comparing, since those are expected
+additions from `:comments link'.
 Returns nil if identical, or a list of differing files.
 When called interactively, reports results in *Messages*."
   (interactive
@@ -524,7 +567,7 @@ When called interactively, reports results in *Messages*."
             (let ((fixup-script (expand-file-name "post-tangle.sh" tmp-dir)))
               (when (file-exists-p fixup-script)
                 (shell-command (format "bash '%s'" fixup-script))))
-            ;; Diff each file
+            ;; Strip comment-link markers from tangled files and diff
             (let ((entries (org-babel-entangle--scan source-dir)))
               (dolist (entry entries)
                 (let* ((rel (org-babel-entangle-entry-rel-path entry))
@@ -533,9 +576,13 @@ When called interactively, reports results in *Messages*."
                   (cond
                    ((not (file-exists-p tangled))
                     (push (format "MISSING: %s" rel) diffs))
-                   ((not (zerop (call-process "diff" nil nil nil
-                                              "-q" orig tangled)))
-                    (push (format "DIFFERS: %s" rel) diffs))))))))
+                   (t
+                    ;; Strip comment-link markers before comparing
+                    (unless (org-babel-entangle-entry-needs-comment-no entry)
+                      (org-babel-entangle--strip-comment-links tangled))
+                    (unless (zerop (call-process "diff" nil nil nil
+                                                 "-q" orig tangled))
+                      (push (format "DIFFERS: %s" rel) diffs)))))))))
       ;; Cleanup
       (delete-directory tmp-dir t))
     (when (called-interactively-p 'any)

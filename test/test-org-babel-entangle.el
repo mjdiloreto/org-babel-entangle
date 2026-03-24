@@ -159,7 +159,7 @@
                  :needs-noweb-no nil
                  :needs-comment-no nil))
          (args (org-babel-entangle--header-args entry)))
-    (should (equal ":tangle src/test.py" args))))
+    (should (equal ":tangle src/test.py :comments link" args))))
 
 (ert-deftest entangle-test-header-args-json ()
   "JSON gets :comments no."
