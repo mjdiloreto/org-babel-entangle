@@ -1,0 +1,51 @@
+#+TITLE: org-babel-entangle
+#+AUTHOR: Matthew DiLoreto
+
+* Overview
+
+=org-babel-entangle= provides the missing "lift" operation for org-babel's tangle/detangle workflow. Given a directory of source files, it generates an org file that round-trips through =org-babel-tangle=:
+
+#+begin_example
+Directory --[entangle]--> Org --[tangle]--> Directory'
+#+end_example
+
+After the initial lift, =tangle= / =detangle= maintain sync bidirectionally. =entangle= only runs once per project (or on re-import).
+
+* Installation
+
+Add to your =load-path= and =(require 'org-babel-entangle)=.
+
+* Usage
+
+** Interactive
+
+#+begin_example
+M-x org-babel-entangle-directory RET /path/to/project RET
+#+end_example
+
+** Batch mode
+
+#+begin_src bash
+emacs --batch -l org-babel-entangle.el \
+  -f org-babel-entangle-batch /path/to/dir output.org
+#+end_src
+
+** Verify round-trip fidelity
+
+#+begin_src elisp
+(org-babel-entangle-verify "project.org" "/path/to/dir")
+#+end_src
+
+* Key features
+
+- =:comments link= by default for detangle compatibility
+- =:comments no= for JSON/text (no comment syntax)
+- Comma-escaping for org-special lines (=*=, =#+=)
+- Shebang detection and =:shebang= header args
+- =:noweb no= when content contains =<<=
+- Post-tangle fixup script for newline edge cases
+- Directory-tree or flat layout strategies
+
+* License
+
+GPL-3.0-or-later
