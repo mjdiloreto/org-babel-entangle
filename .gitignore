@@ -1,0 +1,10 @@
+# Byte-compiled Emacs Lisp
+*.elc
+
+# Backup files
+*~
+\#*\#
+.\#*
+
+# OS artifacts
+.DS_Store
