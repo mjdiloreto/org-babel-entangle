@@ -100,19 +100,24 @@
   :type '(repeat string)
   :group 'org-babel-entangle)
 
-(defcustom org-babel-entangle-no-comment-languages
-  '("json" "text" "markdown" "dot" "toml" "org" "xml"
-    "yaml" "typescript" "go" "rust" "kotlin" "scala"
-    "haskell" "ocaml" "elixir" "erlang" "clojure"
-    "clojurescript" "forth"
-    "racket" "R" "swift" "fish" "dockerfile")
-  "Languages that get `:comments no' (no safe comment syntax).
-Includes languages without built-in Emacs modes that define comment syntax.
-All other languages get `:comments link' for detangle compatibility.
-Languages with built-in comment support: emacs-lisp, python, bash, sh,
-js, C, C++, java, ruby, perl, css, sql, makefile, conf, lua, lisp,
-scheme, html."
+(defcustom org-babel-entangle-comment-link-languages
+  '("emacs-lisp" "python" "bash" "sh" "js" "C" "C++" "java"
+    "ruby" "perl" "css" "sql" "makefile" "conf" "lua" "lisp"
+    "scheme" "html")
+  "Languages that get `:comments link' for detangle compatibility.
+These are languages whose Emacs major modes reliably define `comment-start',
+so org-babel can insert comment-link markers during tangle.
+All other languages get `:comments no' unless auto-detection is enabled."
   :type '(repeat string)
+  :group 'org-babel-entangle)
+
+(defcustom org-babel-entangle-auto-detect-comments nil
+  "When non-nil, probe major modes to detect comment support.
+For languages not in `org-babel-entangle-comment-link-languages', attempt
+to derive the language's major mode and check whether it defines
+`comment-start'.  If so, use `:comments link' for that language.
+This depends on having the appropriate major modes installed."
+  :type 'boolean
   :group 'org-babel-entangle)
 
 (defcustom org-babel-entangle-startup "overview"
@@ -132,6 +137,30 @@ scheme, html."
   :type '(choice (const :tag "Mirror directory tree" directory-tree)
                  (const :tag "Flat list" flat))
   :group 'org-babel-entangle)
+
+;;;; Comment-link detection
+
+(defun org-babel-entangle--lang-supports-comments-p (lang)
+  "Return non-nil if LANG supports `:comments link'.
+Checks `org-babel-entangle-comment-link-languages' first.
+If `org-babel-entangle-auto-detect-comments' is non-nil, also probes
+the language's major mode for `comment-start'."
+  (or (member lang org-babel-entangle-comment-link-languages)
+      (and org-babel-entangle-auto-detect-comments
+           (org-babel-entangle--probe-comment-start lang))))
+
+(defun org-babel-entangle--probe-comment-start (lang)
+  "Return non-nil if LANG's major mode defines `comment-start'.
+Derives the mode name via `org-src-get-lang-mode' if available,
+otherwise tries LANG-mode."
+  (let ((mode (or (and (fboundp 'org-src-get-lang-mode)
+                       (org-src-get-lang-mode lang))
+                  (intern (concat lang "-mode")))))
+    (when (fboundp mode)
+      (with-temp-buffer
+        (ignore-errors
+          (funcall mode)
+          (and comment-start (not (string-empty-p comment-start))))))))
 
 ;;;; Post-tangle fixup application
 
@@ -301,7 +330,7 @@ ROOT is the top-level directory for computing relative paths."
                    (shebang (when (string-match "\\`#!.+\n" content)
                               (match-string 0 content)))
                    (needs-noweb-no (string-match-p "<<[a-zA-Z]" content))
-                   (needs-comment-no (member lang org-babel-entangle-no-comment-languages)))
+                   (needs-comment-no (not (org-babel-entangle--lang-supports-comments-p lang))))
               (push (make-org-babel-entangle-entry
                      :path file
                      :rel-path rel-path

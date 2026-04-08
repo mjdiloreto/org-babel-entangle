@@ -191,6 +191,28 @@
          (args (org-babel-entangle--header-args entry)))
     (should (string-match-p ":tangle-mode" args))))
 
+;;;; Comment-link detection tests
+
+(ert-deftest entangle-test-comment-link-allowlist ()
+  "Languages in the allowlist get comment-link support."
+  (should (org-babel-entangle--lang-supports-comments-p "python"))
+  (should (org-babel-entangle--lang-supports-comments-p "emacs-lisp"))
+  (should (org-babel-entangle--lang-supports-comments-p "bash")))
+
+(ert-deftest entangle-test-comment-link-not-in-allowlist ()
+  "Languages not in the allowlist get :comments no by default."
+  (let ((org-babel-entangle-auto-detect-comments nil))
+    (should-not (org-babel-entangle--lang-supports-comments-p "json"))
+    (should-not (org-babel-entangle--lang-supports-comments-p "yaml"))
+    (should-not (org-babel-entangle--lang-supports-comments-p "forth"))))
+
+(ert-deftest entangle-test-comment-link-auto-detect ()
+  "Auto-detect finds comment-start in emacs-lisp-mode for unlisted lang."
+  (let ((org-babel-entangle-comment-link-languages nil)
+        (org-babel-entangle-auto-detect-comments t))
+    ;; emacs-lisp-mode always available, defines comment-start
+    (should (org-babel-entangle--lang-supports-comments-p "emacs-lisp"))))
+
 ;;;; Fixup generator tests
 
 (ert-deftest entangle-test-fixup-generator ()
