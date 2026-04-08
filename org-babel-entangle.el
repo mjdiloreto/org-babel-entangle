@@ -67,8 +67,10 @@
     (".swift" . "swift") (".kt" . "kotlin") (".sc" . "scala")
     (".hs" . "haskell") (".ml" . "ocaml") (".ex" . "elixir")
     (".exs" . "elixir") (".erl" . "erlang") (".clj" . "clojure")
+    (".cljs" . "clojurescript") (".cljc" . "clojure") (".edn" . "clojure")
     (".lisp" . "lisp") (".scm" . "scheme") (".rkt" . "racket")
-    (".fish" . "fish"))
+    (".fish" . "fish") (".forth" . "forth") (".fth" . "forth")
+    (".4th" . "forth") (".plan" . "text"))
   "Alist mapping file extensions to org-babel language identifiers."
   :type '(alist :key-type string :value-type string)
   :group 'org-babel-entangle)
@@ -85,7 +87,8 @@
 
 (defcustom org-babel-entangle-exclude-directories
   '("node_modules" ".git" "__pycache__" ".tox" "target" "dist" "build"
-    ".eggs" ".mypy_cache" ".pytest_cache" ".venv" "venv" ".claude")
+    ".eggs" ".mypy_cache" ".pytest_cache" ".venv" "venv" ".claude"
+    ".cpcache" ".clj-kondo" ".lsp" ".shadow-cljs")
   "Directory names to exclude from scanning."
   :type '(repeat string)
   :group 'org-babel-entangle)
@@ -101,6 +104,7 @@
   '("json" "text" "markdown" "dot" "toml" "org" "xml"
     "yaml" "typescript" "go" "rust" "kotlin" "scala"
     "haskell" "ocaml" "elixir" "erlang" "clojure"
+    "clojurescript" "forth"
     "racket" "R" "swift" "fish" "dockerfile")
   "Languages that get `:comments no' (no safe comment syntax).
 Includes languages without built-in Emacs modes that define comment syntax.
@@ -128,6 +132,88 @@ scheme, html."
   :type '(choice (const :tag "Mirror directory tree" directory-tree)
                  (const :tag "Flat list" flat))
   :group 'org-babel-entangle)
+
+;;;; Post-tangle fixup application
+
+(defvar-local org-babel-entangle-fixups nil
+  "Post-tangle fixups for this buffer.
+Set as a file-local variable in generated org files.")
+
+(defun org-babel-entangle--fixups-safe-p (val)
+  "Return non-nil if VAL is a safe value for `org-babel-entangle-fixups'."
+  (and (listp val)
+       (cl-every (lambda (f) (and (consp f) (symbolp (car f)))) val)))
+
+(put 'org-babel-entangle-fixups 'safe-local-variable
+     #'org-babel-entangle--fixups-safe-p)
+
+(defun org-babel-entangle--apply-fixup (fixup base-dir)
+  "Apply a single FIXUP relative to BASE-DIR."
+  (pcase (car fixup)
+    ('leading-newlines
+     (let ((fpath (expand-file-name (cadr fixup) base-dir))
+           (count (cddr fixup)))
+       (when (file-exists-p fpath)
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert (make-string count ?\n))
+           (insert-file-contents-literally fpath)
+           (write-region (point-min) (point-max) fpath nil 'silent)))))
+    ('extra-trailing-newlines
+     (let ((fpath (expand-file-name (cadr fixup) base-dir))
+           (count (cddr fixup)))
+       (when (file-exists-p fpath)
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert (make-string count ?\n))
+           (write-region (point-min) (point-max) fpath t 'silent)))))
+    ('no-trailing-newline
+     (let ((fpath (expand-file-name (cdr fixup) base-dir)))
+       (when (file-exists-p fpath)
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert-file-contents-literally fpath)
+           (goto-char (point-max))
+           (when (and (> (point-max) (point-min))
+                      (eq (char-before) ?\n))
+             (delete-char -1))
+           (write-region (point-min) (point-max) fpath nil 'silent)))))
+    ('blank-after-shebang
+     (let ((fpath (expand-file-name (cdr fixup) base-dir)))
+       (when (file-exists-p fpath)
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert-file-contents-literally fpath)
+           (goto-char (point-min))
+           (forward-line 1)
+           (insert "\n")
+           (write-region (point-min) (point-max) fpath nil 'silent)))))))
+
+(defun org-babel-entangle--apply-all-fixups (fixups base-dir)
+  "Apply all FIXUPS relative to BASE-DIR."
+  (dolist (fixup fixups)
+    (org-babel-entangle--apply-fixup fixup base-dir))
+  (message "org-babel-entangle: applied %d post-tangle fixups" (length fixups)))
+
+(defun org-babel-entangle--read-fixups-from-buffer ()
+  "Read fixups from #+ENTANGLE_FIXUPS keyword in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward "^#\\+ENTANGLE_FIXUPS: " nil t)
+      (condition-case nil
+          (read (current-buffer))
+        (error nil)))))
+
+(defun org-babel-entangle--after-tangle (&rest _)
+  "Apply post-tangle fixups if the current buffer has entangle fixup data."
+  (let ((fixups (or (bound-and-true-p org-babel-entangle-fixups)
+                    (org-babel-entangle--read-fixups-from-buffer))))
+    (when fixups
+      (org-babel-entangle--apply-all-fixups
+       fixups
+       (file-name-directory (or (buffer-file-name) default-directory))))))
+
+(advice-add 'org-babel-tangle :after #'org-babel-entangle--after-tangle)
 
 ;;;; Data structures
 
@@ -260,11 +346,32 @@ FIXUPS is a list of (TYPE . REL-PATH) for post-tangle fixups."
       ;; so if body starts with \n there was a blank line between)
       (when (string-prefix-p "\n" body)
         (push (cons 'blank-after-shebang rel-path) fixups)))
+    ;; Detect and strip leading newlines (org-babel strips them on tangle)
+    (when (string-prefix-p "\n" body)
+      (let ((leading-count 0)
+            (pos 0))
+        (while (and (< pos (length body)) (eq (aref body pos) ?\n))
+          (cl-incf leading-count)
+          (cl-incf pos))
+        (when (> leading-count 0)
+          (push (cons 'leading-newlines (cons rel-path leading-count)) fixups)
+          (setq body (substring body leading-count)))))
     ;; Detect trailing newline edge cases before stripping
     (cond
-     ;; File ends with \n\n — org will only add one \n
+     ;; File ends with multiple \n — org will only produce one \n
+     ;; Count extra newlines beyond the one org adds
      ((string-suffix-p "\n\n" body)
-      (push (cons 'extra-trailing-newline rel-path) fixups))
+      (let ((extra-count 0)
+            (pos (1- (length body))))
+        (while (and (>= pos 0) (eq (aref body pos) ?\n))
+          (cl-incf extra-count)
+          (cl-decf pos))
+        ;; org adds exactly one \n, so extra = total - 1
+        (setq extra-count (1- extra-count))
+        (when (> extra-count 0)
+          (push (cons 'extra-trailing-newlines
+                      (cons rel-path extra-count))
+                fixups))))
      ;; File has no trailing \n — org will add one we don't want
      ((and (> (length body) 0)
            (not (string-suffix-p "\n" body)))
@@ -311,8 +418,19 @@ Each element is (TYPE . REL-PATH)."
         (let ((type (car fixup))
               (path (cdr fixup)))
           (pcase type
-            ('extra-trailing-newline
-             (push (format "printf '\\n' >> '%s'" path) lines))
+            ('leading-newlines
+             (let ((count (cddr fixup))
+                   (fpath (cadr fixup)))
+               (push (format "{ printf '%s'; cat '%s'; } > '%s.tmp' && mv '%s.tmp' '%s'"
+                             (apply #'concat (make-list count "\\n"))
+                             fpath fpath fpath fpath)
+                     lines)))
+            ('extra-trailing-newlines
+             (let ((count (cddr fixup))
+                   (fpath (cadr fixup)))
+               (push (format "printf '%s' >> '%s'"
+                             (apply #'concat (make-list count "\\n")) fpath)
+                     lines)))
             ('no-trailing-newline
              (push (format "perl -pi -e 'chomp if eof' '%s'" path) lines))
             ('blank-after-shebang
@@ -386,17 +504,17 @@ ENTRY is non-nil for leaf nodes (actual files)."
         (cl-pushnew (org-babel-entangle-entry-lang entry) langs :test #'equal)))
     (sort langs #'string<)))
 
-(defun org-babel-entangle--file-header (title _entries)
+(defun org-babel-entangle--file-header (title _entries &optional fixups)
   "Generate org file header with TITLE.
 Comments link/no is handled per-block in header-args, not globally,
-because org-babel's property resolution can override per-block args."
+because org-babel's property resolution can override per-block args.
+FIXUPS, if non-nil, are stored as an org keyword for post-tangle use."
   (let ((lines nil))
-    ;; File-local variable for auto-tangle
-    (when org-babel-entangle-auto-tangle
-      (push "# -*- eval: (org-auto-tangle-mode); -*-" lines))
     (push (format "#+TITLE: %s" title) lines)
     (push "#+PROPERTY: header-args :mkdirp yes :padline no" lines)
     (push (format "#+STARTUP: %s" org-babel-entangle-startup) lines)
+    (when fixups
+      (push (format "#+ENTANGLE_FIXUPS: %s" (prin1-to-string fixups)) lines))
     (push "" lines)
     (string-join (nreverse lines) "\n")))
 
@@ -416,8 +534,7 @@ Uses layout strategy from `org-babel-entangle-layout'."
                       ('flat #'org-babel-entangle--layout-flat)
                       (_ #'org-babel-entangle--layout-directory-tree)))
          (layout (funcall layout-fn entries))
-         (header (org-babel-entangle--file-header title entries))
-         (fixup-script (org-babel-entangle--generate-fixups fixups))
+         (header (org-babel-entangle--file-header title entries fixups))
          (body-parts (list header))
          (emitted-dirs (make-hash-table :test 'equal)))
     ;; Build section content
@@ -454,10 +571,18 @@ Uses layout strategy from `org-babel-entangle-layout'."
                         filename
                         (org-babel-entangle--format-src-block entry body))
                 body-parts))))
-    ;; Add fixup script section if needed
-    (when fixup-script
-      (push (format "\n* Build\n\n** post-tangle.sh\n\n#+begin_src bash :tangle post-tangle.sh :tangle-mode (identity #o755)\n%s\n#+end_src\n"
-                    fixup-script)
+    ;; Add file-local variables block
+    (let ((lv-lines nil))
+      (push "# Local Variables:" lv-lines)
+      (when org-babel-entangle-auto-tangle
+        (push "# eval: (when (fboundp 'org-auto-tangle-mode) (org-auto-tangle-mode))"
+              lv-lines))
+      (when fixups
+        (push (format "# org-babel-entangle-fixups: %s"
+                      (prin1-to-string fixups))
+              lv-lines))
+      (push "# End:" lv-lines)
+      (push (concat "\n" (string-join (nreverse lv-lines) "\n") "\n")
             body-parts))
     (string-join (nreverse body-parts) "")))
 
@@ -475,10 +600,14 @@ When called interactively, prompts for DIRECTORY and OUTPUT-FILE."
                                (file-name-nondirectory default-out))))
      (list dir out)))
   (let* ((dir (file-name-as-directory (expand-file-name directory)))
-         (output (or output-file (expand-file-name "project.org" dir)))
+         (output (expand-file-name
+                  (or output-file (expand-file-name "project.org" dir))))
          (title (file-name-nondirectory
                  (directory-file-name dir)))
-         (entries (org-babel-entangle--scan dir))
+         (entries (cl-remove-if
+                   (lambda (e)
+                     (string= (org-babel-entangle-entry-path e) output))
+                   (org-babel-entangle--scan dir)))
          (all-fixups nil))
     (unless entries
       (error "No eligible source files found in %s" dir))
@@ -541,7 +670,8 @@ by `:comments link' during tangle."
 
 ;;;###autoload
 (defun org-babel-entangle-verify (org-file source-dir)
-  "Tangle ORG-FILE into a temp dir, run fixups, diff against SOURCE-DIR.
+  "Tangle ORG-FILE into a temp dir, diff against SOURCE-DIR.
+Post-tangle fixups are applied automatically via advice on `org-babel-tangle'.
 Strips comment-link markers before comparing, since those are expected
 additions from `:comments link'.
 Returns nil if identical, or a list of differing files.
@@ -559,14 +689,10 @@ When called interactively, reports results in *Messages*."
           ;; Copy org file to temp dir
           (copy-file org-file (expand-file-name (file-name-nondirectory org-file) tmp-dir) t)
           (let ((tmp-org (expand-file-name (file-name-nondirectory org-file) tmp-dir)))
-            ;; Tangle
+            ;; Tangle (fixups applied automatically via advice)
             (with-current-buffer (find-file-noselect tmp-org)
               (org-babel-tangle)
               (kill-buffer))
-            ;; Run post-tangle.sh if it was generated
-            (let ((fixup-script (expand-file-name "post-tangle.sh" tmp-dir)))
-              (when (file-exists-p fixup-script)
-                (shell-command (format "bash '%s'" fixup-script))))
             ;; Strip comment-link markers from tangled files and diff
             (let ((entries (org-babel-entangle--scan source-dir)))
               (dolist (entry entries)

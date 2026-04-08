@@ -142,7 +142,7 @@
          (result (org-babel-entangle--encode entry))
          (fixups (cdr result)))
     (should (= 1 (length fixups)))
-    (should (eq 'extra-trailing-newline (caar fixups)))))
+    (should (eq 'extra-trailing-newlines (caar fixups)))))
 
 ;;;; Header args tests
 
@@ -194,12 +194,14 @@
 ;;;; Fixup generator tests
 
 (ert-deftest entangle-test-fixup-generator ()
-  "Fixup script covers all three cases."
-  (let ((fixups '((extra-trailing-newline . "src/a.py")
+  "Fixup script covers all four cases."
+  (let ((fixups '((leading-newlines "src/d.txt" . 2)
+                  (extra-trailing-newlines "src/a.py" . 1)
                   (no-trailing-newline . "src/b.py")
                   (blank-after-shebang . "src/c.sh"))))
     (let ((script (org-babel-entangle--generate-fixups fixups)))
-      (should (string-match-p "printf" script))
+      (should (string-match-p "printf.*cat.*src/d\\.txt" script))
+      (should (string-match-p "printf.*>> 'src/a\\.py'" script))
       (should (string-match-p "chomp if eof" script))
       (should (string-match-p "print \"\\\\n\" if \\$\\. == 2" script)))))
 
