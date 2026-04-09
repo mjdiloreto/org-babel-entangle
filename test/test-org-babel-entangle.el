@@ -213,24 +213,6 @@
     ;; emacs-lisp-mode always available, defines comment-start
     (should (org-babel-entangle--lang-supports-comments-p "emacs-lisp"))))
 
-;;;; Fixup generator tests
-
-(ert-deftest entangle-test-fixup-generator ()
-  "Fixup script covers all four cases."
-  (let ((fixups '((leading-newlines "src/d.txt" . 2)
-                  (extra-trailing-newlines "src/a.py" . 1)
-                  (no-trailing-newline . "src/b.py")
-                  (blank-after-shebang . "src/c.sh"))))
-    (let ((script (org-babel-entangle--generate-fixups fixups)))
-      (should (string-match-p "printf.*cat.*src/d\\.txt" script))
-      (should (string-match-p "printf.*>> 'src/a\\.py'" script))
-      (should (string-match-p "chomp if eof" script))
-      (should (string-match-p "print \"\\\\n\" if \\$\\. == 2" script)))))
-
-(ert-deftest entangle-test-fixup-generator-nil ()
-  "No fixups produces nil."
-  (should (null (org-babel-entangle--generate-fixups nil))))
-
 ;;;; Scanner integration test (uses temp directory)
 
 (ert-deftest entangle-test-scan-temp-dir ()
@@ -280,13 +262,18 @@
           (with-temp-file (expand-file-name "config.yaml" tmp)
             (insert "key: value\n"))
           (let* ((entries (org-babel-entangle--scan tmp))
+                 (encoded-entries nil)
                  (all-fixups nil))
             (dolist (entry entries)
               (let ((result (org-babel-entangle--encode entry)))
+                (push (cons entry (car result)) encoded-entries)
                 (setq all-fixups (append (cdr result) all-fixups))))
-            (let ((org-content (org-babel-entangle--write "test-project" entries all-fixups)))
+            (setq encoded-entries (nreverse encoded-entries))
+            (let ((org-content (org-babel-entangle--write "test-project" encoded-entries all-fixups)))
               ;; Should contain expected structure
               (should (string-match-p "#\\+TITLE: test-project" org-content))
+              (should (string-match-p ":PROPERTIES:" org-content))
+              (should (string-match-p ":header-args:python:" org-content))
               (should (string-match-p ":comments link" org-content))
               (should (string-match-p "begin_src python" org-content))
               (should (string-match-p "begin_src yaml" org-content))

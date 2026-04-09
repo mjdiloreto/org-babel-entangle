@@ -130,6 +130,20 @@ This depends on having the appropriate major modes installed."
   :type 'boolean
   :group 'org-babel-entangle)
 
+(defcustom org-babel-entangle-extra-properties nil
+  "Function to generate extra PROPERTIES drawer entries per file.
+When non-nil, called with an `org-babel-entangle-entry' struct.
+Must return an alist of (KEY . VALUE) strings to add to the
+heading's PROPERTIES drawer, or nil for no extra properties.
+
+Example that adds a custom ID based on the file path:
+  (setq org-babel-entangle-extra-properties
+        (lambda (entry)
+          \\=`((\"CUSTOM_ID\" . ,(org-babel-entangle-entry-rel-path entry)))))"
+  :type '(choice (const :tag "None" nil)
+                 function)
+  :group 'org-babel-entangle)
+
 (defcustom org-babel-entangle-layout 'directory-tree
   "How to organize files into org headings.
 `directory-tree' mirrors the filesystem hierarchy.
@@ -412,7 +426,8 @@ FIXUPS is a list of (TYPE . REL-PATH) for post-tangle fixups."
     (cons body fixups)))
 
 (defun org-babel-entangle--header-args (entry)
-  "Build header-args string for ENTRY's src block."
+  "Build header-args string for ENTRY.
+Returns a string suitable for a :header-args:LANG: property value."
   (let* ((rel-path (org-babel-entangle-entry-rel-path entry))
          (shebang (org-babel-entangle-entry-shebang entry))
          (needs-noweb-no (org-babel-entangle-entry-needs-noweb-no entry))
@@ -424,47 +439,12 @@ FIXUPS is a list of (TYPE . REL-PATH) for post-tangle fixups."
             args))
     (when (and executable-p (not shebang))
       (push ":tangle-mode (identity #o755)" args))
-    ;; Comments: per-block to avoid org property resolution issues
     (if needs-comment-no
         (push ":comments no" args)
       (push ":comments link" args))
     (when needs-noweb-no
       (push ":noweb no" args))
     (string-join (nreverse args) " ")))
-
-;;;; Fixup generator
-
-(defun org-babel-entangle--generate-fixups (fixup-list)
-  "Generate post-tangle.sh content from FIXUP-LIST.
-Each element is (TYPE . REL-PATH)."
-  (when fixup-list
-    (let ((lines '("#!/usr/bin/env bash"
-                   "# Post-tangle fixups for byte-exact fidelity."
-                   "# Run from the directory containing the org file."
-                   "set -euo pipefail"
-                   "cd \"$(dirname \"$0\")\"" "")))
-      (dolist (fixup (nreverse fixup-list))
-        (let ((type (car fixup))
-              (path (cdr fixup)))
-          (pcase type
-            ('leading-newlines
-             (let ((count (cddr fixup))
-                   (fpath (cadr fixup)))
-               (push (format "{ printf '%s'; cat '%s'; } > '%s.tmp' && mv '%s.tmp' '%s'"
-                             (apply #'concat (make-list count "\\n"))
-                             fpath fpath fpath fpath)
-                     lines)))
-            ('extra-trailing-newlines
-             (let ((count (cddr fixup))
-                   (fpath (cadr fixup)))
-               (push (format "printf '%s' >> '%s'"
-                             (apply #'concat (make-list count "\\n")) fpath)
-                     lines)))
-            ('no-trailing-newline
-             (push (format "perl -pi -e 'chomp if eof' '%s'" path) lines))
-            ('blank-after-shebang
-             (push (format "perl -i -pe 'print \"\\n\" if $. == 2' '%s'" path) lines)))))
-      (string-join (nreverse lines) "\n"))))
 
 ;;;; Layout engine
 
@@ -516,23 +496,6 @@ ENTRY is non-nil for leaf nodes (actual files)."
 
 ;;;; Writer
 
-(defun org-babel-entangle--no-comment-languages (entries)
-  "Collect the set of no-comment languages actually used in ENTRIES."
-  (let (langs)
-    (dolist (entry entries)
-      (when (org-babel-entangle-entry-needs-comment-no entry)
-        (cl-pushnew (org-babel-entangle-entry-lang entry) langs :test #'equal)))
-    (sort langs #'string<)))
-
-(defun org-babel-entangle--executable-languages (entries)
-  "Collect languages that have executable files in ENTRIES."
-  (let (langs)
-    (dolist (entry entries)
-      (when (or (org-babel-entangle-entry-executable-p entry)
-                (org-babel-entangle-entry-shebang entry))
-        (cl-pushnew (org-babel-entangle-entry-lang entry) langs :test #'equal)))
-    (sort langs #'string<)))
-
 (defun org-babel-entangle--file-header (title _entries &optional fixups)
   "Generate org file header with TITLE.
 Comments link/no is handled per-block in header-args, not globally,
@@ -547,18 +510,41 @@ FIXUPS, if non-nil, are stored as an org keyword for post-tangle use."
     (push "" lines)
     (string-join (nreverse lines) "\n")))
 
-(defun org-babel-entangle--format-src-block (entry body)
-  "Format a src block for ENTRY with BODY content."
-  (let ((lang (org-babel-entangle-entry-lang entry))
-        (header-args (org-babel-entangle--header-args entry)))
-    (concat (format "#+begin_src %s %s\n" lang header-args)
+(defun org-babel-entangle--format-section (entry body)
+  "Format a complete section for ENTRY with BODY content.
+Returns a string containing the PROPERTIES drawer and src block.
+Calls `org-babel-entangle-extra-properties' if set to add user properties."
+  (let* ((lang (org-babel-entangle-entry-lang entry))
+         (header-args (org-babel-entangle--header-args entry))
+         (prop-key (format "header-args:%s" lang))
+         (props (list (cons prop-key header-args)))
+         (extra (when org-babel-entangle-extra-properties
+                  (funcall org-babel-entangle-extra-properties entry))))
+    (when extra
+      (setq props (append props extra)))
+    (concat (org-babel-entangle--format-properties props)
+            (format "#+begin_src %s\n" lang)
             body "\n"
             "#+end_src\n")))
 
-(defun org-babel-entangle--write (title entries fixups &optional _config)
-  "Assemble org file string from TITLE, ENTRIES, and FIXUPS.
+(defun org-babel-entangle--format-properties (props)
+  "Format PROPS alist as an org PROPERTIES drawer.
+Each element is (KEY . VALUE)."
+  (when props
+    (concat ":PROPERTIES:\n"
+            (mapconcat (lambda (p)
+                         (format ":%s: %s" (car p) (cdr p)))
+                       props "\n")
+            "\n:END:\n")))
+
+(defun org-babel-entangle--write (title encoded-entries fixups)
+  "Assemble org file string from TITLE, ENCODED-ENTRIES, and FIXUPS.
+ENCODED-ENTRIES is an alist of (ENTRY . BODY) where BODY is the
+pre-encoded src block content from `org-babel-entangle--encode'.
 Uses layout strategy from `org-babel-entangle-layout'."
-  (let* ((layout-fn (pcase org-babel-entangle-layout
+  (let* ((entries (mapcar #'car encoded-entries))
+         (body-table (make-hash-table :test 'eq))
+         (layout-fn (pcase org-babel-entangle-layout
                       ('directory-tree #'org-babel-entangle--layout-directory-tree)
                       ('flat #'org-babel-entangle--layout-flat)
                       (_ #'org-babel-entangle--layout-directory-tree)))
@@ -566,6 +552,9 @@ Uses layout strategy from `org-babel-entangle-layout'."
          (header (org-babel-entangle--file-header title entries fixups))
          (body-parts (list header))
          (emitted-dirs (make-hash-table :test 'equal)))
+    ;; Index pre-encoded bodies by entry
+    (dolist (pair encoded-entries)
+      (puthash (car pair) (cdr pair) body-table))
     ;; Build section content
     (dolist (item layout)
       (let* ((dir (nth 0 item))
@@ -588,17 +577,16 @@ Uses layout strategy from `org-babel-entangle-layout'."
                               (make-string (1+ i) ?*)
                               (nth i dir-parts))
                       body-parts)))))
-        ;; File heading and src block
-        (let* ((encode-result (org-babel-entangle--encode entry))
-               (body (car encode-result))
+        ;; File heading with PROPERTIES drawer and src block
+        (let* ((body (gethash entry body-table))
                (depth (if (eq org-babel-entangle-layout 'directory-tree)
                           (1+ (length dir-parts))
                         1))
                (stars (make-string depth ?*)))
-          (push (format "\n%s %s\n\n%s"
+          (push (format "\n%s %s\n%s"
                         stars
                         filename
-                        (org-babel-entangle--format-src-block entry body))
+                        (org-babel-entangle--format-section entry body))
                 body-parts))))
     ;; Add file-local variables block
     (let ((lv-lines nil))
@@ -640,19 +628,21 @@ When called interactively, prompts for DIRECTORY and OUTPUT-FILE."
          (all-fixups nil))
     (unless entries
       (error "No eligible source files found in %s" dir))
-    ;; Collect fixups from all entries
-    (dolist (entry entries)
-      (let ((encode-result (org-babel-entangle--encode entry)))
-        (setq all-fixups (append (cdr encode-result) all-fixups))))
-    ;; Reverse fixups to maintain file order
-    (setq all-fixups (nreverse all-fixups))
-    ;; Generate and write org file
-    (let ((org-content (org-babel-entangle--write title entries all-fixups)))
-      (with-temp-file output
-        (insert org-content))
-      (message "Entangled %d files from %s into %s"
-               (length entries) dir output)
-      output)))
+    ;; Encode all entries once, collecting bodies and fixups
+    (let ((encoded-entries nil))
+      (dolist (entry entries)
+        (let ((encode-result (org-babel-entangle--encode entry)))
+          (push (cons entry (car encode-result)) encoded-entries)
+          (setq all-fixups (append (cdr encode-result) all-fixups))))
+      (setq encoded-entries (nreverse encoded-entries))
+      (setq all-fixups (nreverse all-fixups))
+      ;; Generate and write org file
+      (let ((org-content (org-babel-entangle--write title encoded-entries all-fixups)))
+        (with-temp-file output
+          (insert org-content))
+        (message "Entangled %d files from %s into %s"
+                 (length entries) dir output)
+        output))))
 
 ;;;###autoload
 (defun org-babel-entangle-batch ()
