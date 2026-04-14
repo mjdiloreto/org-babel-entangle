@@ -281,5 +281,37 @@
               (should (string-match-p ":tangle config\\.yaml" org-content)))))
       (delete-directory tmp t))))
 
+;;;; Minor mode tests
+
+(ert-deftest entangle-test-minor-mode-toggle ()
+  "Minor mode adds and removes advice on `org-babel-tangle'."
+  ;; Ensure mode is off
+  (org-babel-entangle-mode -1)
+  (should-not (advice-member-p #'org-babel-entangle--after-tangle 'org-babel-tangle))
+  ;; Turn on
+  (org-babel-entangle-mode 1)
+  (should (advice-member-p #'org-babel-entangle--after-tangle 'org-babel-tangle))
+  ;; Turn off
+  (org-babel-entangle-mode -1)
+  (should-not (advice-member-p #'org-babel-entangle--after-tangle 'org-babel-tangle)))
+
+;;;; After-directory hook tests
+
+(ert-deftest entangle-test-after-directory-hook ()
+  "Hook runs after `org-babel-entangle-directory' with output file bound."
+  (let ((tmp (make-temp-file "entangle-hook-" t))
+        (captured-file nil))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "main.py" tmp)
+            (insert "print('hello')\n"))
+          (let ((org-babel-entangle-after-directory-hook
+                 (list (lambda () (setq captured-file org-babel-entangle-output-file)))))
+            (org-babel-entangle-directory tmp)
+            (should captured-file)
+            (should (string-match-p "project\\.org$" captured-file))
+            (should (file-exists-p captured-file))))
+      (delete-directory tmp t))))
+
 (provide 'test-org-babel-entangle)
 ;;; test-org-babel-entangle.el ends here
