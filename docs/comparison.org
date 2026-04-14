@@ -1,0 +1,185 @@
+#+TITLE: Testing & Multi-Block Comparison: org-babel-entangle vs org-tanglesync
+
+* Context
+
+Comparing testing approaches and the multi-block tangle scenario across three
+projects in this space: org-babel-entangle (ours), org-tanglesync (mtekman),
+and ob-tangle-sync (mtekman's rewrite, not merged into org-mode).
+
+* Testing comparison
+
+** org-babel-entangle: 23 ERT tests, 4 tiers
+
+| Tier        | Count | What                                                                                              |
+|-------------+-------+---------------------------------------------------------------------------------------------------|
+| Unit        |    16 | Pure functions: language detection, comma escaping, encoding, header args, comment-link detection |
+| Integration |     2 | Scanner (temp dir), end-to-end scan→encode→write pipeline                                         |
+| Behavioral  |     2 | Minor mode toggle, after-directory hook                                                           |
+| External    |     1 | Forth round-trip (74 files, 0 diffs)                                                              |
+
+Testability comes from separating pure functions from I/O and using
+=cl-defstruct= as a clean interface between phases.
+
+** org-tanglesync: Zero tests
+
+No test file, no ERT, no CI. Consequences visible in the code:
+
+- =org-tanglesync-watch-perform-sync= has a 3-param signature but is called
+  with 2 args (latent crash)
+- =(goto-char 0)= instead of =(goto-char (point-min))= — wrong with narrowing
+- =condition-case= + =string-match= on error messages as control flow — brittle
+- Core diff detection logic untested
+
+** ob-tangle-sync: Not merged
+
+mtekman's 2023 rewrite proposed for org-mode core. Uses built-in
+=org-babel-tangle=/=org-babel-detangle= under the hood. Had a 77-message
+mailing list thread. Ihor Radchenko (org maintainer) rejected it, citing
+unexpected results with *multiple src blocks targeting the same file*.
+
+* Multi-block scenario: "split 1 block into 2, tangle, re-entangle"
+
+** org-babel-entangle
+
+Unit of entanglement is *one file = one src block*. On re-entangle:
+
+- The 2-block structure is silently collapsed back into 1 block
+- If =:comments link= was active, the tangled file contains comment-link
+  markers that become *literal content* in the new block — pollution that
+  degrades on each cycle
+- =org-babel-entangle-verify= still passes (it strips markers before diffing)
+  but the org file is corrupted
+
+*org-babel-entangle is a one-way operation* (directory → org). Not designed
+for tangle → re-entangle cycles.
+
+** org-tanglesync
+
+Compares each block against the *entire tangled file*:
+
+1. Block 1 (imports) vs whole file → diff → overwrite block 1 with entire file
+2. Block 2 (functions) vs whole file → diff → overwrite block 2 with entire file
+3. Both blocks now contain the full file → next tangle *duplicates content*
+
+Data corruption bug. No concept of "this block contributes a portion of the
+file."
+
+** Built-in org-babel-detangle
+
+This actually works for multi-block files, provided =:comments link= is set:
+
+- Iterates through comment-link markers in the tangled file
+- Each marker has a back-reference (=[[file:project.org::*heading]]=)
+- Follows the link, calls =org-babel-update-block-body= per block
+- Processes each block independently → multi-block files round-trip correctly
+
+Limitation: if comment markers are destroyed or new code is added outside any
+marked section, there's no mechanism to route changes back.
+
+** ob-tangle-sync (proposed, rejected)
+
+Added =:tangle-sync pull= header arg. Used built-in detangle under the hood.
+Rejected because multi-block-per-file gave unexpected results — the exact
+scenario we're analyzing.
+
+* Capability matrix
+
+| Capability                           | entangle           | tanglesync         | built-in detangle      | ob-tangle-sync  |
+|--------------------------------------+--------------------+--------------------+------------------------+-----------------|
+| Dir → Org                            | Yes (core purpose) | No                 | No                     | No              |
+| Org → File → Org (1 block/file)      | Via verify         | Yes (core purpose) | Yes                    | Yes             |
+| Org → File → Org (N blocks/file)     | No                 | Corrupts           | Yes (with markers)     | Rejected (buggy)|
+| Watch mode (auto-sync on save)       | No                 | Yes                | No                     | Proposed        |
+| Tests                                | 23 ERT             | None               | org-mode's test suite  | None            |
+
+* Conclusion: Three tools, one lifecycle
+
+The multi-block gap in org-babel-entangle is *by design* — it maps the
+filesystem's file-level granularity. Understanding why requires seeing how the
+three tools compose into a complete literate programming workflow.
+
+** The bootstrap problem
+
+You have a directory of source files. You want to bring them into a literate
+org document. This is entangle's job: scan the filesystem, create one src block
+per file, infer languages, set =:tangle= paths. The result is a working org
+file that round-trips through =org-babel-tangle= back to the original
+directory.
+
+At this point the org file is flat — one block per file, no prose, no
+multi-block structure. The filesystem has no opinion about how a file should be
+split across org headings. entangle faithfully represents what the filesystem
+contains: files.
+
+** The authoring phase
+
+Now the human takes over. They restructure the org file into a literate
+document: add prose, split blocks into logical sections, create headings,
+introduce noweb references. A single =main.py= might become three blocks under
+different headings — imports, core logic, CLI entry point — all with
+=:tangle main.py=.
+
+This restructuring is *authorial work* that cannot be automated. No tool can
+decide where one logical section ends and another begins. The human is adding
+semantic structure the flat file doesn't contain.
+
+** The ongoing sync cycle
+
+After authoring, the workflow is:
+
+#+begin_example
+org file ──tangle──→ source files ──edit──→ source files ──detangle──→ org file
+    ↑                                                                       │
+    └───────────────────────── edit org ←───────────────────────────────────┘
+#+end_example
+
+1. *tangle* (built-in): Org blocks → filesystem. Each block with =:tangle
+   main.py= contributes its portion. With =:comments link=, each portion gets
+   bracketed by comment markers containing back-references to the org file.
+
+2. *Edit source*: The programmer edits =main.py= in their IDE — adds a
+   function, fixes a bug. The comment markers survive normal editing.
+
+3. *detangle* (built-in): Reads the comment markers, follows each
+   back-reference to the specific org block, calls =org-babel-update-block-body=
+   to overwrite just that block's content. Three blocks targeting =main.py= →
+   three independent updates. Multi-block round-trips correctly.
+
+4. *Edit org*: The programmer continues writing prose, restructuring blocks,
+   adding new sections. Then tangles again.
+
+** Why entangle doesn't belong in this cycle
+
+entangle is the *bootstrap step* — it runs once, before any of this structure
+exists. By the time multi-block structures appear, the human has already done
+the authoring work that created them, and =tangle=/=detangle= handle the
+ongoing sync. Re-running entangle would destroy the authored structure by
+collapsing everything back to one-block-per-file.
+
+This is why the multi-block gap isn't a bug to fix — it's a phase boundary.
+entangle operates before multi-block structure exists. detangle operates after.
+They never need to handle the same scenario.
+
+** Why tanglesync fails at this
+
+org-tanglesync tries to occupy the detangle role but compares each block
+against the *entire file* rather than the block's contribution to it. Without
+comment-link markers, it has no way to know which bytes belong to which block.
+The result is data corruption on any multi-block file.
+
+The built-in detangle solves this correctly because tangle already embeds the
+mapping via comment markers. The information about "which bytes came from which
+block" is written into the tangled file at tangle time. detangle just reads it
+back.
+
+** The complete picture
+
+| Phase     | Tool     | Direction | When                                   |
+|-----------+----------+-----------+----------------------------------------|
+| Bootstrap | entangle | dir → org | Once, to import existing code          |
+| Author    | human    | —         | Restructure org into literate document |
+| Export    | tangle   | org → dir | Ongoing, after each org edit           |
+| Sync back | detangle | dir → org | Ongoing, after each source edit        |
+
+These are four distinct phases with four distinct actors. No single tool needs
+to span all of them.
